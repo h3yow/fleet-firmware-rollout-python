@@ -14,7 +14,7 @@ class RolloutService:
     def __init__(
         self,
         config: RolloutConfig | None = None,
-        known_versions: tuple[str, ...] = ("1.0.0", "1.1.0", "1.2.0"),
+        known_versions: tuple[str, ...] = ("0.9.0", "1.0.0", "1.1.0", "1.2.0"),
     ) -> None:
         self._config = config or RolloutConfig()
         self._registry = FirmwareRegistry(set(known_versions))
