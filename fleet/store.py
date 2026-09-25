@@ -108,7 +108,6 @@ class FleetStore:
             for device in self._devices.values():
                 if (
                     device.status is DeviceStatus.ONLINE
-                    and device.last_seen
                     and now - device.last_seen > self._config.offline_timeout_s
                 ):
                     device.status = DeviceStatus.OFFLINE
