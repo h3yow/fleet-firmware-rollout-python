@@ -389,10 +389,11 @@ class FleetStore:
 
     def _bind_and_dispatch(self, release: Release, members: list[str],
                            command: str, version: str | None) -> list[DispatchItem]:
-        items: list[DispatchItem] = []
-        for device_id in members:
-            device = self._devices[device_id]
-            if command == "update":
+        # validate every device before mutating anything: a failed start must
+        # not leave a release half-bound.
+        if command == "update":
+            for device_id in members:
+                device = self._devices[device_id]
                 if device.active_release_id is not None:
                     raise RolloutError(
                         "device_busy",
@@ -404,16 +405,21 @@ class FleetStore:
                         "device_busy",
                         f"device {device_id} is already updating",
                     )
+        items: list[DispatchItem] = []
+        for device_id in members:
+            device = self._devices[device_id]
+            if command == "update":
                 device.active_release_id = release.release_id
                 device.target_version = release.to_version
                 device.stable_version = device.firmware_version
                 release.dispatched.add(device_id)
-            items.append(DispatchItem(
+            item = DispatchItem(
                 device_id=device_id, release_id=release.release_id,
                 command=command,
                 version=version if version is not None else release.to_version,
-            ))
-            self._commands[device_id].append(items[-1])
+            )
+            items.append(item)
+            self._commands[device_id].append(item)
         return items
 
     def _enqueue(self, device_id: str, release_id: str,
@@ -430,11 +436,17 @@ class FleetStore:
             if release.state is not ReleaseState.PENDING:
                 raise RolloutError("not_pending",
                                    f"release is {release.state.value}")
+            members = release.batch_members(0)
+            try:
+                items = self._bind_and_dispatch(
+                    release, members, "update", None)
+            except RolloutError:
+                release.state = ReleaseState.PENDING
+                release.current_batch = -1
+                raise
             release.state = ReleaseState.ACTIVE
             release.current_batch = 0
             self._record(release, EventKind.STARTED)
-            members = release.batch_members(0)
-            items = self._bind_and_dispatch(release, members, "update", None)
             self._record(release, EventKind.DISPATCHED, batch=0,
                          device_ids=list(members))
             return items
@@ -498,6 +510,9 @@ class FleetStore:
 
             next_batch = batch + 1
             members = release.batch_members(next_batch)
+            # bind + queue first while state is still ACTIVE/batch; on error
+            # nothing has changed, so a concurrent re-check still sees a
+            # consistent release.
             items = self._bind_and_dispatch(release, members, "update", None)
             release.current_batch = next_batch
             self._record(release, EventKind.BATCH_ADVANCED,
