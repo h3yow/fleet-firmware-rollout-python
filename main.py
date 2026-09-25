@@ -1,12 +1,13 @@
+"""Local entry point: start the API on 127.0.0.1 with an ephemeral port."""
+
+from __future__ import annotations
+
 import uvicorn
-from fastapi import FastAPI
 
-app = FastAPI()
+from fleet.api import create_app
+from fleet.service import RolloutService
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app(RolloutService())
 
 
 if __name__ == "__main__":
