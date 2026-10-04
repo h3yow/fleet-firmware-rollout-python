@@ -31,6 +31,7 @@ class ReleaseState(str, enum.Enum):
     PAUSED = "paused"
     COMPLETED = "completed"
     ROLLED_BACK = "rolled_back"
+    CANCELLED = "cancelled"
 
 
 class ReportKind(str, enum.Enum):
@@ -74,6 +75,8 @@ class EventKind(str, enum.Enum):
     DEVICE_UPDATED = "device_updated"
     DEVICE_FAILED = "device_failed"
     DEVICE_ROLLED_BACK = "device_rolled_back"
+    CANCELLED = "cancelled"
+    DEVICE_RELEASED = "device_released"
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,10 @@ class RolloutConfig:
     failure_threshold: float = 0.3
     offline_timeout_s: float = 30.0
     min_known_version: str = "1.0.0"
+    # Maximum number of releases that may be concurrently in progress
+    # (active / paused, or rollback in flight). Pending/terminal releases do
+    # not count; a start beyond this limit is rejected wholesale.
+    max_active_releases: int = 3
 
 
 @dataclass

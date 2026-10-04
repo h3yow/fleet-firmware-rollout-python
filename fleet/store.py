@@ -34,10 +34,14 @@ from .versioning import compare_version
 class RolloutError(Exception):
     """Operation rejected by the state machine; ``reason`` is machine-readable."""
 
-    def __init__(self, reason: str, message: str):
+    def __init__(self, reason: str, message: str,
+                 details: dict | None = None):
         super().__init__(message)
         self.reason = reason
         self.message = message
+        # Optional structured payload (e.g. conflicting device ids) so callers
+        # do not have to parse the human-readable message.
+        self.details = details or {}
 
 
 def _now() -> float:
@@ -74,6 +78,198 @@ class FleetStore:
     def release_snapshot(self, release_id: str) -> dict:
         with self._lock:
             return asdict(self._releases[release_id])
+
+    # ------------------------------------------------- multi-release planning
+
+    def _rollback_in_flight(self, release: Release) -> bool:
+        """A ROLLED_BACK release still owns devices whose rollback is pending."""
+        if release.state is not ReleaseState.ROLLED_BACK:
+            return False
+        return any(
+            self._devices[d].active_release_id == release.release_id
+            for d in release.dispatched
+        )
+
+    def _release_is_in_progress(self, release: Release) -> bool:
+        """Whether a release still counts against parallelism / admissions.
+
+        ACTIVE/PAUSED always do. A ROLLED_BACK release keeps counting until
+        every dispatched device has acknowledged its rollback, because its
+        target devices stay reserved until then.
+        """
+        if release.state in (ReleaseState.ACTIVE, ReleaseState.PAUSED):
+            return True
+        return self._rollback_in_flight(release)
+
+    def _occupied_devices(self, release: Release) -> set[str]:
+        """Devices that a release currently reserves against other plans."""
+        if release.state in (ReleaseState.ACTIVE, ReleaseState.PAUSED):
+            # The whole target set is reserved for the lifetime of the plan,
+            # including devices in batches that have not dispatched yet.
+            return set(release.target_device_ids)
+        if release.state is ReleaseState.ROLLED_BACK:
+            return {
+                d for d in release.dispatched
+                if self._devices[d].active_release_id == release.release_id
+            }
+        return set()
+
+    def _admission_conflicts(
+        self, device_ids: list[str],
+    ) -> dict[str, list[str]]:
+        """Map each conflicting device id to the release id that owns it."""
+        conflicts: dict[str, list[str]] = {}
+        for release in self._releases.values():
+            occupied = self._occupied_devices(release)
+            if not occupied:
+                continue
+            for device_id in device_ids:
+                if device_id in occupied:
+                    conflicts.setdefault(device_id, []).append(
+                        release.release_id)
+        return conflicts
+
+    # ------------------------------------------------------------- summaries
+
+    def _release_summary(self, release: Release) -> dict:
+        """Self-consistent view of one plan, computed under the store lock."""
+        state = release.state
+        batch = release.current_batch
+        total = len(release.target_device_ids)
+        dispatched = len(release.dispatched)
+        ok = len(release.succeeded)
+        bad = len(release.failed)
+        decided = ok + bad
+        rolled = len(release.rolled_back_devices)
+
+        # Current-batch ratios (the numbers the safety valve / gate use).
+        if batch >= 0:
+            b_total, b_ok, b_bad = self._batch_stats(release, batch)
+            batch_health = b_ok / b_total if b_total else 0.0
+            batch_failure = b_bad / b_total if b_total else 0.0
+        else:
+            b_total = b_ok = b_bad = 0
+            batch_health = batch_failure = 0.0
+
+        # Overall ratios over the whole plan.
+        health_rate = ok / total if total else 0.0
+        failure_rate = bad / total if total else 0.0
+
+        # What the plan is currently doing / what its next verdict would be.
+        if state is ReleaseState.ACTIVE:
+            if b_total and b_ok + b_bad < b_total:
+                gate = "waiting_for_reports"
+            elif b_total and batch_health < self._config.health_threshold:
+                gate = "blocked_health_below_threshold"
+            elif batch == len(release.batch_percentages) - 1:
+                gate = "final_batch_healthy_completable"
+            else:
+                gate = "ready_to_advance"
+        elif state is ReleaseState.ROLLED_BACK:
+            gate = ("rollback_in_flight"
+                    if self._rollback_in_flight(release)
+                    else "rollback_complete")
+        elif state in (ReleaseState.PAUSED,):
+            gate = "paused"
+        elif state is ReleaseState.PENDING:
+            gate = "not_started"
+        elif state is ReleaseState.COMPLETED:
+            gate = "done_completed"
+        else:
+            gate = "done_cancelled"
+
+        # Cross-check device reality: the verdict above must match the
+        # firmware version / binding of each target device.
+        mismatches: list[dict] = []
+        for device_id in release.target_device_ids:
+            device = self._devices[device_id]
+            bound = device.active_release_id == release.release_id
+            ver = device.firmware_version
+            if state in (ReleaseState.ACTIVE, ReleaseState.PAUSED):
+                if device_id in release.dispatched and not bound:
+                    mismatches.append({"device_id": device_id,
+                                       "problem": "dispatched but unbound"})
+                if device_id in release.succeeded and ver != release.to_version:
+                    mismatches.append({"device_id": device_id,
+                        "problem": f"succeeded but version {ver} != "
+                                   f"{release.to_version}"})
+            elif state is ReleaseState.COMPLETED:
+                if bound:
+                    mismatches.append({"device_id": device_id,
+                                       "problem": "still bound after completion"})
+                if ver != release.to_version:
+                    mismatches.append({"device_id": device_id,
+                        "problem": f"version {ver} != target "
+                                   f"{release.to_version}"})
+            elif state is ReleaseState.ROLLED_BACK:
+                if bound and device.stable_version is not None and \
+                        device.status is DeviceStatus.UPDATING:
+                    # waiting for the device to execute its rollback: fine
+                    pass
+                elif bound:
+                    mismatches.append({"device_id": device_id,
+                        "problem": "bound with no pending rollback"})
+                elif device_id in release.rolled_back_devices and \
+                        device.stable_version is not None:
+                    mismatches.append({"device_id": device_id,
+                        "problem": "rolled back but stable_version not cleared"})
+            elif state is ReleaseState.CANCELLED:
+                if bound:
+                    mismatches.append({"device_id": device_id,
+                                       "problem": "still bound after cancellation"})
+
+        return {
+            "release_id": release.release_id,
+            "state": state.value,
+            "in_progress": self._release_is_in_progress(release),
+            "from_version": release.from_version,
+            "to_version": release.to_version,
+            "batch_count": len(release.batch_percentages),
+            "current_batch": batch,
+            "total_devices": total,
+            "dispatched": dispatched,
+            "succeeded": ok,
+            "failed": bad,
+            "rolled_back": rolled,
+            "decided": decided,
+            "pending_decisions": max(0, dispatched - decided)
+                if state in (ReleaseState.ACTIVE, ReleaseState.PAUSED) else 0,
+            "current_batch_size": b_total,
+            "current_batch_succeeded": b_ok,
+            "current_batch_failed": b_bad,
+            "batch_health_rate": round(batch_health, 4),
+            "batch_failure_rate": round(batch_failure, 4),
+            "overall_health_rate": round(health_rate, 4),
+            "overall_failure_rate": round(failure_rate, 4),
+            "gate": gate,
+            "consistent": not mismatches,
+            "mismatches": mismatches,
+        }
+
+    def release_summary(self, release_id: str) -> dict:
+        with self._lock:
+            return self._release_summary(self._releases[release_id])
+
+    def list_releases(self,
+                      state: ReleaseState | str | None = None) -> dict:
+        """List all plans (in-progress and finished) with one summary each.
+
+        The whole listing is computed inside the same lock, so concurrent
+        reports can never make one entry disagree with another.
+        """
+        wanted = state.value if isinstance(state, ReleaseState) else state
+        with self._lock:
+            entries = [
+                self._release_summary(r)
+                for r in self._releases.values()
+                if wanted is None or r.state.value == wanted
+            ]
+            in_progress = sum(1 for e in entries if e["in_progress"])
+            return {
+                "releases": entries,
+                "in_progress_count": in_progress,
+                "max_active_releases": self._config.max_active_releases,
+            }
 
     # ------------------------------------------------------------- registration
 
@@ -436,6 +632,36 @@ class FleetStore:
             if release.state is not ReleaseState.PENDING:
                 raise RolloutError("not_pending",
                                    f"release is {release.state.value}")
+
+            # Admission gate 1: parallel-plan cap. Every check below happens
+            # before any mutation, so a rejection leaves nothing half-created.
+            in_progress = [
+                r.release_id for r in self._releases.values()
+                if self._release_is_in_progress(r)
+            ]
+            limit = self._config.max_active_releases
+            if len(in_progress) >= limit:
+                raise RolloutError(
+                    "active_release_limit",
+                    f"{len(in_progress)} release(s) already in progress "
+                    f"{sorted(in_progress)}; limit is {limit}",
+                    details={"limit": limit,
+                             "in_progress": sorted(in_progress)},
+                )
+
+            # Admission gate 2: device exclusivity over the *whole* target
+            # set, not only the first batch. A later-batch collision must be
+            # reported up front, never halfway through the rollout.
+            conflicts = self._admission_conflicts(release.target_device_ids)
+            if conflicts:
+                devices = sorted(conflicts)
+                raise RolloutError(
+                    "device_busy",
+                    f"target devices {devices} already belong to in-progress "
+                    f"plan(s): {conflicts}",
+                    details={"devices": devices, "conflicts": conflicts},
+                )
+
             members = release.batch_members(0)
             try:
                 items = self._bind_and_dispatch(
@@ -581,6 +807,68 @@ class FleetStore:
                          auto_resolved=sorted(
                              release.rolled_back_devices), reason=reason)
             return items
+
+    def _release_device_binding(self, device: Device, release: Release,
+                                status: DeviceStatus | None = None) -> None:
+        """Detach a device from a plan once the plan no longer owns it."""
+        if status is not None:
+            device.status = status
+        device.active_release_id = None
+        device.target_version = None
+        device.stable_version = None
+        self._record(release, EventKind.DEVICE_RELEASED,
+                     device_id=device.device_id)
+
+    def cancel_release(self, release_id: str,
+                       reason: str = "manual") -> list[str]:
+        """End a plan without rollback and release its devices immediately.
+
+        Allowed from ``pending`` (nothing dispatched) or ``active``/``paused``.
+        Devices that were dispatched are put back on their stable version --
+        cancellation is an operator decision to abandon the update, not to
+        roll forward. Dispatched-but-undecided devices are unbound at once; a
+        later device report is then a harmless orphan (rejected via the normal
+        ``not_expected`` path) instead of resurrecting the cancelled plan.
+        """
+        with self._lock:
+            release = self._releases.get(release_id)
+            if release is None:
+                raise RolloutError("not_found", f"release {release_id} missing")
+            if release.state not in (ReleaseState.PENDING,
+                                     ReleaseState.ACTIVE,
+                                     ReleaseState.PAUSED):
+                raise RolloutError(
+                    "not_cancellable",
+                    f"release is {release.state.value}, cannot cancel",
+                )
+            release.state = ReleaseState.CANCELLED
+            released: list[str] = []
+            for device_id in release.target_device_ids:
+                device = self._devices[device_id]
+                if device.active_release_id != release_id:
+                    continue
+                if device_id in release.dispatched and (
+                    device_id not in release.succeeded
+                    and device_id not in release.failed
+                ):
+                    # Was heading to (or queued for) the new version: revert
+                    # firmware to the pre-plan stable version.
+                    device.firmware_version = device.stable_version
+                    status = (DeviceStatus.FAILED
+                              if device.status is DeviceStatus.FAILED
+                              else DeviceStatus.ONLINE)
+                    self._release_device_binding(device, release, status)
+                else:
+                    # Succeeded devices stay on the new version; failed
+                    # devices stay failed; never-dispatched are untouched.
+                    status = (DeviceStatus.FAILED
+                              if device_id in release.failed
+                              else None)
+                    self._release_device_binding(device, release, status)
+                released.append(device_id)
+            self._record(release, EventKind.CANCELLED, reason=reason,
+                         released=sorted(released))
+            return sorted(released)
 
     def pending_commands(self, device_id: str) -> list[DispatchItem]:
         """Drain and return queued commands for one (simulated) device."""

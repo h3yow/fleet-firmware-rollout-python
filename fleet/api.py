@@ -36,6 +36,10 @@ class RollbackIn(BaseModel):
     reason: str = "manual"
 
 
+class CancelIn(BaseModel):
+    reason: str = "manual"
+
+
 def create_app(service: RolloutService | None = None) -> FastAPI:
     service = service or RolloutService()
     store = service.store
@@ -44,6 +48,7 @@ def create_app(service: RolloutService | None = None) -> FastAPI:
     def _raise(exc: RolloutError) -> None:
         raise HTTPException(status_code=409, detail={
             "reason": exc.reason, "message": exc.message,
+            **({"details": exc.details} if exc.details else {}),
         })
 
     def _ack_payload(ack) -> dict:
@@ -104,6 +109,25 @@ def create_app(service: RolloutService | None = None) -> FastAPI:
             return store.release_snapshot(release_id)
         except KeyError:
             raise HTTPException(404, detail={"reason": "not_found"})
+
+    @app.get("/releases/{release_id}/summary")
+    def release_summary(release_id: str):
+        try:
+            return store.release_summary(release_id)
+        except KeyError:
+            raise HTTPException(404, detail={"reason": "not_found"})
+
+    @app.get("/releases")
+    def list_releases(state: Optional[str] = None):
+        return store.list_releases(state)
+
+    @app.post("/releases/{release_id}/cancel")
+    def cancel_release(release_id: str, body: CancelIn):
+        try:
+            released = store.cancel_release(release_id, body.reason)
+        except RolloutError as exc:
+            _raise(exc)
+        return {"released_devices": released, "state": "cancelled"}
 
     @app.post("/releases/{release_id}/start")
     def start_release(release_id: str):

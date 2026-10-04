@@ -102,3 +102,72 @@ def test_api_rollback_endpoint():
         f"最终版本={snap['firmware_version']}",
     )
     assert snap["firmware_version"] == "1.0.0"
+
+
+def test_api_multi_plan_admission_listing_and_cancel():
+    from fleet.models import RolloutConfig
+    from fleet.service import RolloutService
+
+    svc = RolloutService(RolloutConfig(batch_percentages=(100,),
+                                       max_active_releases=1))
+    client = TestClient(create_app(svc))
+    for d in ("d1", "d2", "d3"):
+        client.post("/devices", json={"device_id": d, "version": "1.0.0"})
+
+    client.post("/releases", json={
+        "release_id": "r1", "to_version": "1.1.0",
+        "device_ids": ["d1", "d2"]})
+    r = client.post("/releases/r1/start")
+    assert r.status_code == 200
+
+    # overlapping start -> 409 device_busy with structured details
+    client.post("/releases", json={
+        "release_id": "r2", "to_version": "1.2.0", "device_ids": ["d2"]})
+    r = client.post("/releases/r2/start")
+    body = r.json()["detail"]
+    show_case(
+        "HTTP 冲突准入",
+        "r1 占用 d1,d2; start r2=[d2] (上限=1 之外也有设备冲突)",
+        f"status={r.status_code} reason={body['reason']} "
+        f"details={body.get('details')}",
+    )
+    assert r.status_code == 409
+    assert body["reason"] in ("device_busy", "active_release_limit")
+
+    # listing reports one in-progress plan and is self-consistent
+    r = client.get("/releases")
+    data = r.json()
+    show_case(
+        "HTTP 计划列表与汇总",
+        "GET /releases（含进行中与已结束计划）",
+        f"进行中={data['in_progress_count']}/{data['max_active_releases']}; "
+        f"每计划字段含 batch/比例/gate/consistent",
+    )
+    assert data["in_progress_count"] == 1
+    r1 = next(e for e in data["releases"] if e["release_id"] == "r1")
+    assert r1["consistent"] is True
+    for key in ("current_batch", "batch_health_rate", "batch_failure_rate",
+                "overall_health_rate", "overall_failure_rate", "gate",
+                "state", "succeeded", "failed"):
+        assert key in r1
+
+    # state filter works too
+    pending = client.get("/releases", params={"state": "pending"}).json()
+    assert [e["release_id"] for e in pending["releases"]] == ["r2"]
+
+    # single-plan summary endpoint
+    r = client.get("/releases/r1/summary")
+    assert r.status_code == 200 and r.json()["gate"] in (
+        "waiting_for_reports", "final_batch_healthy_completable")
+
+    # cancel r1 and the devices are released
+    r = client.post("/releases/r1/cancel", json={"reason": "ops stop"})
+    assert r.status_code == 200 and r.json()["state"] == "cancelled"
+    assert set(r.json()["released_devices"]) == {"d1", "d2"}
+    r = client.post("/releases/r2/start")
+    show_case(
+        "HTTP 取消后释放复用",
+        "cancel r1 后启动之前被拒的 r2=[d2]",
+        f"status={r.status_code}; r2 state={r.json().get('state')}",
+    )
+    assert r.status_code == 200
