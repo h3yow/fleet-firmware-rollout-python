@@ -134,19 +134,22 @@ def test_device_can_only_join_one_active_release(store):
     store.register_device("d1", "1.0.0")
     store.register_device("d2", "1.0.0")
     store.create_release("r1", "1.1.0", ["d1"])
-    store.create_release("r2", "1.2.0", ["d1", "d2"])
-    store.start_release("r1")
+    # admission is now at creation time: an overlapping plan is rejected
+    # up front, before any state is created for it.
     with pytest.raises(RolloutError) as exc:
-        store.start_release("r2")
+        store.create_release("r2", "1.2.0", ["d1", "d2"])
     show_case(
         "设备互斥：同一设备不能同时参与两个进行中的发布",
-        "r1 占用 d1 后, 尝试 start r2(包含 d1)",
-        f"start(r2) 被拒原因={exc.value.reason}: {exc.value.message}",
+        "r1(进行中) 已包含 d1, 尝试创建 r2(包含 d1, d2)",
+        f"create(r2) 被拒原因={exc.value.reason}: {exc.value.message}; "
+        f"冲突明细={exc.value.conflicts}",
     )
-    assert exc.value.reason == "device_busy"
-    # r1 remains the sole active release; d2 untouched
-    assert store.release_snapshot("r1")["state"] == ReleaseState.ACTIVE.value
-    assert store.release_snapshot("r2")["state"] == ReleaseState.PENDING.value
+    assert exc.value.reason == "device_conflict"
+    assert exc.value.conflicts == {"d1": "r1"}
+    # r1 remains the sole in-progress release; r2 was never created
+    assert store.release_snapshot("r1")["state"] == ReleaseState.PENDING.value
+    with pytest.raises(KeyError):
+        store.release_snapshot("r2")
 
 
 def test_concurrent_start_does_not_skip_batch_or_double_dispatch(store):

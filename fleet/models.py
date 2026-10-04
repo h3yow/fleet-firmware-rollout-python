@@ -31,6 +31,17 @@ class ReleaseState(str, enum.Enum):
     PAUSED = "paused"
     COMPLETED = "completed"
     ROLLED_BACK = "rolled_back"
+    CANCELLED = "cancelled"
+
+
+#: States in which a release still holds its devices and blocks admission of
+#: overlapping releases. Everything else (completed / rolled_back / cancelled)
+#: is terminal and releases its devices for reuse.
+IN_PROGRESS_STATES = frozenset({
+    ReleaseState.PENDING,
+    ReleaseState.ACTIVE,
+    ReleaseState.PAUSED,
+})
 
 
 class ReportKind(str, enum.Enum):
@@ -65,6 +76,7 @@ class EventKind(str, enum.Enum):
 
     CREATED = "created"
     STARTED = "started"
+    CANCELLED = "cancelled"
     DISPATCHED = "dispatched"
     BATCH_ADVANCED = "batch_advanced"
     PAUSED = "paused"
@@ -90,6 +102,9 @@ class RolloutConfig:
     failure_threshold: float = 0.3
     offline_timeout_s: float = 30.0
     min_known_version: str = "1.0.0"
+    # Maximum number of concurrently in-progress releases (pending/active/
+    # paused). Creating one more is rejected outright with no side effects.
+    max_active_releases: int = 4
 
 
 @dataclass

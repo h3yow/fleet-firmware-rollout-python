@@ -15,6 +15,7 @@ from copy import deepcopy
 from dataclasses import asdict
 
 from .models import (
+    IN_PROGRESS_STATES,
     Device,
     DeviceReport,
     DeviceStatus,
@@ -32,12 +33,19 @@ from .versioning import compare_version
 
 
 class RolloutError(Exception):
-    """Operation rejected by the state machine; ``reason`` is machine-readable."""
+    """Operation rejected by the state machine; ``reason`` is machine-readable.
 
-    def __init__(self, reason: str, message: str):
+    ``conflicts`` optionally carries a machine-readable ``{device_id:
+    release_id}`` map when admission fails because target devices are already
+    owned by in-progress releases.
+    """
+
+    def __init__(self, reason: str, message: str,
+                 conflicts: dict[str, str] | None = None):
         super().__init__(message)
         self.reason = reason
         self.message = message
+        self.conflicts = conflicts or {}
 
 
 def _now() -> float:
@@ -74,6 +82,69 @@ class FleetStore:
     def release_snapshot(self, release_id: str) -> dict:
         with self._lock:
             return asdict(self._releases[release_id])
+
+    def _summary_locked(self, release: Release) -> dict:
+        """Consistent point-in-time summary of one release.
+
+        Must be called under the lock: every number is derived from the same
+        sets that report handlers mutate, so the summary can never disagree
+        with the device states those reports produced.
+        """
+        dispatched = len(release.dispatched)
+        succeeded = len(release.succeeded)
+        failed = len(release.failed)
+        bound = sum(
+            1 for d in release.target_device_ids
+            if self._devices[d].active_release_id == release.release_id
+        )
+        batch = release.current_batch
+        batch_total = batch_ok = batch_bad = 0
+        if 0 <= batch < len(release.batch_percentages):
+            batch_total, batch_ok, batch_bad = self._batch_stats(release, batch)
+        return {
+            "release_id": release.release_id,
+            "state": release.state.value,
+            "to_version": release.to_version,
+            "current_batch": batch,
+            "batch_count": len(release.batch_percentages),
+            "targets": len(release.target_device_ids),
+            "dispatched": dispatched,
+            "succeeded": succeeded,
+            "failed": failed,
+            "rolled_back_devices": len(release.rolled_back_devices),
+            # devices still bound to this release (rollback draining if the
+            # release is already rolled back)
+            "bound_devices": bound,
+            "health": (succeeded / dispatched) if dispatched else None,
+            "failure_rate": (failed / dispatched) if dispatched else None,
+            "batch": {
+                "index": batch,
+                "members": batch_total,
+                "succeeded": batch_ok,
+                "failed": batch_bad,
+                "health": (batch_ok / batch_total) if batch_total else None,
+                "failure_rate": (batch_bad / batch_total)
+                if batch_total else None,
+            },
+        }
+
+    def release_summary(self, release_id: str) -> dict:
+        with self._lock:
+            release = self._releases.get(release_id)
+            if release is None:
+                raise RolloutError("not_found", f"release {release_id} missing")
+            return self._summary_locked(release)
+
+    def list_releases(self) -> list[dict]:
+        """Summaries of every release, in-progress and finished alike."""
+        with self._lock:
+            return [
+                self._summary_locked(r)
+                for r in sorted(
+                    self._releases.values(),
+                    key=lambda r: (r.created_at, r.release_id),
+                )
+            ]
 
     # ------------------------------------------------------------- registration
 
@@ -355,6 +426,55 @@ class FleetStore:
         device.target_version = None
         device.stable_version = None
 
+    # ------------------------------------------------------------- admission
+
+    def _in_progress(self) -> list[Release]:
+        return [r for r in self._releases.values()
+                if r.state in IN_PROGRESS_STATES]
+
+    def _check_admission(self, device_ids: list[str]) -> None:
+        """Whole-plan admission control, run before any state is created.
+
+        Two independent gates, both evaluated against *all* target devices of
+        the new plan (not just the first batch):
+
+        1. concurrency cap: number of in-progress releases must stay below
+           ``max_active_releases``;
+        2. device exclusivity: no target device may appear in any in-progress
+           release's target set, nor still be bound to a release whose
+           rollback has not finished draining.
+        """
+        running = self._in_progress()
+        if len(running) >= self._config.max_active_releases:
+            raise RolloutError(
+                "too_many_releases",
+                f"{len(running)} releases already in progress "
+                f"(max {self._config.max_active_releases}): "
+                f"{sorted(r.release_id for r in running)}",
+            )
+        owner: dict[str, str] = {}
+        for release in running:
+            for device_id in release.target_device_ids:
+                owner.setdefault(device_id, release.release_id)
+        conflicts: dict[str, str] = {}
+        for device_id in device_ids:
+            if device_id in owner:
+                conflicts[device_id] = owner[device_id]
+                continue
+            bound = self._devices[device_id].active_release_id
+            if bound is not None:
+                # bound to a release whose rollback is still draining
+                conflicts[device_id] = bound
+        if conflicts:
+            detail = ", ".join(
+                f"{d}->{r}" for d, r in sorted(conflicts.items()))
+            raise RolloutError(
+                "device_conflict",
+                f"target devices already owned by in-progress "
+                f"release(s): {detail}",
+                conflicts=conflicts,
+            )
+
     # --------------------------------------------------------------- releases
 
     def create_release(
@@ -374,6 +494,7 @@ class FleetStore:
                                    f"unregistered devices: {unknown}")
             if not device_ids:
                 raise RolloutError("empty_targets", "release has no devices")
+            self._check_admission(device_ids)
             release = Release(
                 release_id=release_id,
                 from_version=from_version or "",
@@ -581,6 +702,29 @@ class FleetStore:
                          auto_resolved=sorted(
                              release.rolled_back_devices), reason=reason)
             return items
+
+    def cancel_release(self, release_id: str, reason: str = "manual") -> None:
+        """Cancel a plan that was created but never started.
+
+        A pending release has not bound or dispatched any device yet, so
+        cancelling is side-effect free for devices: the plan simply leaves
+        the in-progress set and stops blocking admission. An active plan
+        must be ended via :meth:`rollback_release` instead, so in-flight
+        devices are safely returned to their stable versions.
+        """
+        with self._lock:
+            release = self._releases.get(release_id)
+            if release is None:
+                raise RolloutError("not_found", f"release {release_id} missing")
+            if release.state is not ReleaseState.PENDING:
+                raise RolloutError(
+                    "not_pending",
+                    f"only a pending release can be cancelled "
+                    f"(is {release.state.value}); use rollback for an "
+                    f"active release",
+                )
+            release.state = ReleaseState.CANCELLED
+            self._record(release, EventKind.CANCELLED, reason=reason)
 
     def pending_commands(self, device_id: str) -> list[DispatchItem]:
         """Drain and return queued commands for one (simulated) device."""

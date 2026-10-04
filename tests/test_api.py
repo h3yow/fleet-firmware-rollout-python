@@ -102,3 +102,50 @@ def test_api_rollback_endpoint():
         f"最终版本={snap['firmware_version']}",
     )
     assert snap["firmware_version"] == "1.0.0"
+
+
+def test_api_parallel_releases_conflict_and_listing():
+    client = TestClient(create_app(_service()))
+    for d in ("d1", "d2", "d3"):
+        client.post("/devices", json={"device_id": d, "version": "1.0.0"})
+
+    client.post("/releases", json={
+        "release_id": "r1", "to_version": "1.1.0", "device_ids": ["d1"]})
+    client.post("/releases", json={
+        "release_id": "r2", "to_version": "1.2.0", "device_ids": ["d2"]})
+
+    # overlapping plan -> 409 with machine-readable conflict map
+    r = client.post("/releases", json={
+        "release_id": "r3", "to_version": "1.2.0",
+        "device_ids": ["d1", "d3"]})
+    conflict = r.json()["detail"]
+    show_case(
+        "HTTP 多计划并行与冲突准入",
+        "r1(d1)/r2(d2) 进行中; 新建 r3(d1,d3)",
+        f"r3 -> {r.status_code} reason={conflict['reason']} "
+        f"conflicts={conflict['conflicts']}",
+    )
+    assert r.status_code == 409
+    assert conflict["reason"] == "device_conflict"
+    assert conflict["conflicts"] == {"d1": "r1"}
+    # r3 was never created
+    assert client.get("/releases/r3").status_code == 404
+
+    # listing shows every plan with progress + health figures
+    listing = client.get("/releases").json()["releases"]
+    by_id = {s["release_id"]: s for s in listing}
+    assert set(by_id) == {"r1", "r2"}
+    assert by_id["r1"]["state"] == "pending"
+    assert by_id["r1"]["batch_count"] == 1
+
+    # cancel a pending plan, then its device can join a new plan
+    r = client.post("/releases/r2/cancel", json={"reason": "superseded"})
+    assert r.status_code == 200 and r.json()["state"] == "cancelled"
+    r = client.post("/releases", json={
+        "release_id": "r4", "to_version": "1.2.0", "device_ids": ["d2"]})
+    assert r.status_code == 200
+    states = {s["release_id"]: s["state"]
+              for s in client.get("/releases").json()["releases"]}
+    print(f"  取消后: r2={states['r2']}, r4={states['r4']} (设备已复用)")
+    assert states["r2"] == "cancelled"
+    assert states["r4"] == "pending"

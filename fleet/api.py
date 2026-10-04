@@ -42,9 +42,10 @@ def create_app(service: RolloutService | None = None) -> FastAPI:
     app = FastAPI(title="Fleet firmware rollout (local simulation)")
 
     def _raise(exc: RolloutError) -> None:
-        raise HTTPException(status_code=409, detail={
-            "reason": exc.reason, "message": exc.message,
-        })
+        detail = {"reason": exc.reason, "message": exc.message}
+        if exc.conflicts:
+            detail["conflicts"] = exc.conflicts
+        raise HTTPException(status_code=409, detail=detail)
 
     def _ack_payload(ack) -> dict:
         return {
@@ -98,12 +99,23 @@ def create_app(service: RolloutService | None = None) -> FastAPI:
         return {"release_id": release.release_id,
                 "state": release.state.value}
 
+    @app.get("/releases")
+    def list_releases():
+        return {"releases": store.list_releases()}
+
     @app.get("/releases/{release_id}")
     def get_release(release_id: str):
         try:
             return store.release_snapshot(release_id)
         except KeyError:
             raise HTTPException(404, detail={"reason": "not_found"})
+
+    @app.get("/releases/{release_id}/summary")
+    def get_release_summary(release_id: str):
+        try:
+            return store.release_summary(release_id)
+        except RolloutError as exc:
+            raise HTTPException(404, detail={"reason": exc.reason})
 
     @app.post("/releases/{release_id}/start")
     def start_release(release_id: str):
@@ -132,6 +144,14 @@ def create_app(service: RolloutService | None = None) -> FastAPI:
             _raise(exc)
         return {"dispatched": [vars(i) for i in items],
                 "state": "rolled_back"}
+
+    @app.post("/releases/{release_id}/cancel")
+    def cancel_release(release_id: str, body: RollbackIn):
+        try:
+            store.cancel_release(release_id, body.reason)
+        except RolloutError as exc:
+            _raise(exc)
+        return {"state": "cancelled"}
 
     @app.post("/maintenance/offline-sweep")
     def offline_sweep():
